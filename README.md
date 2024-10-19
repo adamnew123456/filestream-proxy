@@ -6,7 +6,7 @@ connection and the forwarder passes its data to some other host:
 
 ```bash
 $ mkdir /tmp/fs-proxy
-$ dotnet run listen /tmp/fs-proxy 8000 &
+$ dotnet run listen /tmp/fs-proxy 127.0.0.1:8000 &
 $ dotnet run forward /tmp/fs-proxy 1.1.1.1:80 &
 $ curl -H 'Host: 1.1.1.1' http://localhost:8000
 ```
@@ -39,11 +39,6 @@ and get a functional TCP connection from the server to a port on my machine.
 
 # Is it fast?
 
-If you need this you probably don't care, but if I put the directory on a tmpfs
-and run iperf over the tunnel, I get about 8 MB/s (~60 Mbits/s). That's a best
-case scenario though and in real use you'll get a lot slower.
-
-This can probably be optimized by using a smarter locking mechanism and more
-efficient file IO (you could even get really smart and do some kind of per-page
-locking to reduce contention between the reader and writer), but frankly I'm glad
-to have it working at all.
+No. In the process of adding multi-connection support, something (I suspect
+lock management) has gotten noticeably worse. It's still fast enough for SSH
+though.
