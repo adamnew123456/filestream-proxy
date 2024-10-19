@@ -16,20 +16,17 @@ You can run SSH or anything else over this thing if you want.)
 
 # What does it do?
 
-It creates four files in the given directory:
+The core of this tool is the *pipe file*, which supports ordered communication
+between two processes using a pair of shared files, the pipe data file and the
+pipe lock file. Note that a pipe file is unidirectional - you need a pair of
+pipe files to get full duplex communication.
 
-- A pair of 'pipe' files. These are a collection of 'pages' (currently 64
-  buffers each 8KB long), each of which has some data in it and a serial
-  number for tracking ordering.
-
-- A pair of lock files. These mediate access to the pipe files, only one
-  process can access a pipe file at the same time.
-
-The listener and forwarder each run a pair of threads, one of which copies data
-out of *one* pipe file and onto a socket, and the other receives data from the
-socket and writes it to the *other* pipe file. The listener and forwarder
-connect their readers and writers to opposite pipes to get bidirectional
-communication!
+At the start, both the listener and the forwarder create a command pipe. This
+pipe carries notifications about connection data - opens and closes. When the
+listener gets a connection it configures a separate pipe for that connection,
+notifies the forwarder, and starts a connection worker that passes data between
+the socket and the pipe. The forwarder then creates a connection to the remote
+address and also runs a connection worker.
 
 # Eck! Why?
 
