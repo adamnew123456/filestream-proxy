@@ -159,6 +159,7 @@ namespace filestream_proxy
         public void Clean()
         {
             File.Delete(LockPath);
+            File.Delete(PipePath);
         }
     }
 
@@ -882,7 +883,7 @@ namespace filestream_proxy
     {
         private static void Usage(string context)
         {
-            Console.WriteLine("Usage: filestream-proxy (listen DIRECTORY IP:PORT | forward DIRECTORY IP:PORT)");
+            Console.WriteLine("Usage: filestream-proxy (listen DIRECTORY IP:PORT | forward DIRECTORY IP:PORT | clean DIRECTORY)");
             Console.WriteLine(context);
             Environment.Exit(1);
         }
@@ -890,7 +891,7 @@ namespace filestream_proxy
         public static void Main(string[] args)
         {
             if (args.Length == 0)
-                Usage("Either 'listen' or 'forward' is required");
+                Usage("'listen', 'forward', or 'clean' is required");
 
             switch (args[0])
             {
@@ -910,6 +911,15 @@ namespace filestream_proxy
                         TunnelService.NewControlWritePipe(args[1]),
                         TunnelService.NewControlReadPipe(args[1]));
                     service.Run();
+                    break;
+                }
+                case "clean":
+                {
+                    var rpipe = TunnelService.NewControlReadPipe(args[1]);
+                    rpipe.Clean();
+                    
+                    var wpipe = TunnelService.NewControlWritePipe(args[1]);
+                    wpipe.Clean();
                     break;
                 }
                 default:
