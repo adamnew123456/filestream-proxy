@@ -26,12 +26,15 @@ namespace filestream_proxy
         }
         
         /// Sends repeatedly until the socket has accepted the entire span.
-        public static void SendAll(this Socket socket, ReadOnlySpan<byte> span)
+        public static void SendAll(this Socket socket, ReadOnlySpan<byte> span, CancellationToken cancel)
         {
             var offset = 0;
             var toSend = span.Length;
             while (toSend > 0)
             {
+                if (cancel.IsCancellationRequested)
+                    throw new OperationCanceledException();
+                    
                 var sent = socket.Send(span.Slice(offset, toSend));
                 offset += sent;
                 toSend -= sent;
@@ -463,11 +466,15 @@ namespace filestream_proxy
     /// Basic interface for connection workers to use when cancelling themselves and checking their status.
     interface IConnectionMaster
     {
+        /// Identifier for the connection. Unique among live connections, but may be recycled
+        /// after the current connection closes.
+        public byte Id { get; }
+
         /// Cancellation used to stop the connection worker.
         public CancellationToken Token { get; }
 
         /// Request that the connection worker stops. May be called from inside the worker.
-        public void Cancel(string reason);
+        public void Cancel(bool notifyPeer, string reason);
     }
 
     /// Passes data between a socket and a read/write pipe file.
@@ -501,25 +508,18 @@ namespace filestream_proxy
             var writeBuffer = new byte[_readPipe.PageCapacity];
             var writerTask = WriterTask(writeSerial, writeBuffer);
 
-            var timer = Stopwatch.StartNew();
-            var connectionId = $"<connection {_socket.LocalEndPoint} {_socket.RemoteEndPoint}>";
-            while (true)
+            var connectionId = $"<connection {_master.Id} {_socket.LocalEndPoint} {_socket.RemoteEndPoint}>";
+            while (!_master.Token.IsCancellationRequested)
             {
-                if (_master.Token.IsCancellationRequested) break;
-
                 try
                 {
                     var action = Task.WaitAny(readerTask, writerTask);
                     if (action == 0)
                     {
-                        var nextSerial = readerTask.Result;
-                        if (nextSerial != null)
-                            readSerial = nextSerial.Value;
-                        else
-                            Console.WriteLine($"{connectionId} cancelling due to empty read");
+                        readSerial = readerTask.Result;
                         readerTask = ReaderTask(readSerial, readBuffer);
                     }
-                    else
+                    else if (action == 1)
                     {
                         writeSerial = writerTask.Result;
                         writerTask = WriterTask(writeSerial, writeBuffer);
@@ -529,29 +529,28 @@ namespace filestream_proxy
                 {
                     if (err is AggregateException)
                         err = ((AggregateException)err).InnerExceptions[0];
-                    Console.WriteLine($"{connectionId} received error {err.Message}, closing");
-                    _master.Cancel("connection exception");
-                }
-
-                if (timer.ElapsedMilliseconds > 5000)
-                {
-                    Console.WriteLine($"{connectionId} ms={timer.ElapsedMilliseconds} read={Interlocked.Exchange(ref _bytesRead, 0)} wrote={Interlocked.Exchange(ref _bytesWritten, 0)}");
-                    timer.Restart();
+                    Console.WriteLine($"{connectionId} received error [{err.Message}], closing");
+                    _master.Cancel(true, "connection exception");
+                    break;
                 }
             }
             
-            Console.WriteLine($"{connectionId} remainder read={Interlocked.Read(ref _bytesRead)} wrote={Interlocked.Read(ref _bytesWritten)}");
+            Console.WriteLine($"{connectionId} read={Interlocked.Read(ref _bytesRead)} wrote={Interlocked.Read(ref _bytesWritten)}");
             _socket.Close();
+            _socket.Dispose();
         }
 
         /// Receives data from the socket and passes it into the read pipe.
-        private async Task<ulong?> ReaderTask(ulong serial, byte[] buffer)
+        private async Task<ulong> ReaderTask(ulong serial, byte[] buffer)
         {
             var read = await _socket.ReceiveAsync(buffer, SocketFlags.None, _master.Token);
             if (read == 0)
             {
-                _master.Cancel("empty read");
-                return null;
+                // Avoid spinning if the socket isn't doing any IO. Also check that the socket is
+                // still live - a zero-byte read could indicate closure.
+                await _socket.SendAsync(new ReadOnlyMemory<byte>(buffer, 0, 0), SocketFlags.None, _master.Token);
+                await Task.Delay(CheckInterval);
+                return serial;
             }
 
             Interlocked.Add(ref _bytesRead, read);
@@ -564,7 +563,7 @@ namespace filestream_proxy
         {
             var page = await PipeFile.ReadAndReleaseAsync(_writePipe, serial, buffer, CheckInterval, _master.Token);
             Interlocked.Add(ref _bytesWritten, page.Size);
-            _socket.SendAll(buffer.AsSpan()[..(int)page.Size]);
+            _socket.SendAll(buffer.AsSpan()[..(int)page.Size], _master.Token);
             return serial + 1;
         }
     }
@@ -575,15 +574,17 @@ namespace filestream_proxy
         private Thread _worker;
         private CancellationTokenSource _source;
         
-        /// The token used to stop the connection worker.
+        public byte Id { get; }
         public CancellationToken Token { get; }
         
-        /// Whether a close message has been sent to the peer.
-        public bool PeerNotified { get; set; }
+        /// Whether to notify the other end of the control pipe. Not required when the peer requested the close, but
+        /// will be true if the socket closed on our end.
+        public bool NotifyPeer { get; private set; }
 
-        public ConnectionContext()
+        public ConnectionContext(byte id)
         {
             _source = new CancellationTokenSource();
+            Id = id;
             Token = _source.Token;
         }
 
@@ -597,13 +598,15 @@ namespace filestream_proxy
         /// Waits for the worker thread to stop.
         public void Join()
         {
+            Console.WriteLine($"<cancel> waiting for {Id} thread to join");
             _worker.Join();
         }
 
         /// Asks the worker to stop itself.
-        public void Cancel(string reason)
+        public void Cancel(bool notifyPeer, string reason)
         {
-            Console.WriteLine($"<cancel> explicitly requested by {reason}");
+            Console.WriteLine($"<cancel> explicitly requested by {reason}, for {Id}");
+            NotifyPeer = notifyPeer;
             _source.Cancel();
         }
 
@@ -617,6 +620,7 @@ namespace filestream_proxy
     abstract class TunnelService
     {
         protected static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
+        protected static readonly TimeSpan ConnectionReapInterval = TimeSpan.FromSeconds(1);
         private const int MaxConnections = byte.MaxValue;
         private const int ControlPageCount = 8;
         private const int ControlPageSize = ControlMessage.TotalSize;
@@ -629,7 +633,7 @@ namespace filestream_proxy
 
         private ulong _readSerial = PageHeader.SerialUnused + 1;
         private ulong _writeSerial = PageHeader.SerialUnused + 1;
-        protected ConnectionContext?[] _connections = new ConnectionContext?[MaxConnections];
+        protected readonly ConnectionContext?[] _connections = new ConnectionContext?[MaxConnections];
         
         /// Creates a pipe for sending control messages.
         public static PipeFileConfig NewControlReadPipe(string pipeDirectory)
@@ -691,19 +695,17 @@ namespace filestream_proxy
         }
 
         /// Triggers the connection's cancellation token, and if necessary notifies the peer about the connection closure.
-        protected void RequestConnectionClose(byte connectionId, string reason)
+        protected void RequestConnectionClose(byte connectionId)
         {
             if (_connections[connectionId] == null) return;
-            _connections[connectionId].Cancel(reason);
-            
-            if (_connections[connectionId].PeerNotified) return;
-            _connections[connectionId].PeerNotified = true;
-            SendControlMessage(ControlCommand.Close, connectionId);
+            _connections[connectionId].Cancel(true, "requested by peer");
         }
         
         /// Checks all valid connections and closes any whose cancellations have triggered.
         protected void WaitForCompletedConnections()
         {
+            var live = 0;
+            var dead = 0;
             for (byte i = 0; i < _connections.Length; i++)
             {
                 if (_connections[i] == null) continue;
@@ -711,16 +713,19 @@ namespace filestream_proxy
                 var cnx = _connections[i];
                 if (cnx.Token.IsCancellationRequested)
                 {
-                    if (!cnx.PeerNotified)
-                    {
-                        cnx.PeerNotified = true;
+                    if (cnx.NotifyPeer)
                         SendControlMessage(ControlCommand.Close, i);
-                    }
+                    
                     cnx.Join();
                     cnx.Dispose();
                     _connections[i] = null;
+                    dead++;
                 }
+                else
+                    live++;
             }
+            if (live > 0 || dead > 0)
+                Console.WriteLine($"<tunnel> reaped collections live={live} dead={dead}");
         }
 
         /// Creates a pipe for sending socket data.
@@ -777,7 +782,8 @@ namespace filestream_proxy
 
             while (true)
             {
-                var action = Task.WaitAny(listenerTask, writerTask, Task.Delay(CheckInterval));
+                var reaperClock = Stopwatch.StartNew();
+                var action = Task.WaitAny(listenerTask, writerTask, Task.Delay(ConnectionReapInterval));
                 switch (action)
                 {
                     case 0:
@@ -797,7 +803,7 @@ namespace filestream_proxy
                             var workerWritePipe = NewWorkerWritePipe((byte)newConnectionId);
                             workerReadPipe.Clean();
                             workerWritePipe.Clean();
-                            var context = new ConnectionContext();
+                            var context = new ConnectionContext((byte)newConnectionId);
                             var worker = new ConnectionWorker(client, context, workerReadPipe, workerWritePipe);
                             context.Start(worker);
                             
@@ -814,14 +820,18 @@ namespace filestream_proxy
                         if (message.Command == ControlCommand.Close)
                         {
                             Console.WriteLine($"<listener> peer closing {message.ConnectionId}");
-                            RequestConnectionClose(message.ConnectionId, "peer closure");
+                            RequestConnectionClose(message.ConnectionId);
                         }
                         writerTask = WriterTask();
                         break;
                     }
                 }
-                
-                WaitForCompletedConnections();
+
+                if (reaperClock.Elapsed >= ConnectionReapInterval)
+                {
+                    reaperClock.Restart();
+                    WaitForCompletedConnections();
+                }
             }
         }
     }
@@ -843,7 +853,8 @@ namespace filestream_proxy
 
             while (true)
             {
-                var action = Task.WaitAny(writerTask, Task.Delay(CheckInterval));
+                var reaperClock = Stopwatch.StartNew();
+                var action = Task.WaitAny(writerTask, Task.Delay(ConnectionReapInterval));
                 if (action == 0)
                 {
                     var message = writerTask.Result;
@@ -857,7 +868,7 @@ namespace filestream_proxy
 
                             var workerReadPipe = NewWorkerReadPipe(message.ConnectionId);
                             var workerWritePipe = NewWorkerWritePipe(message.ConnectionId);
-                            var context = new ConnectionContext();
+                            var context = new ConnectionContext(message.ConnectionId);
                             var worker = new ConnectionWorker(client, context, workerWritePipe, workerReadPipe);
                             context.Start(worker);
 
@@ -867,14 +878,18 @@ namespace filestream_proxy
                         }
                         case ControlCommand.Close:
                             Console.WriteLine($"<remote> peer closing {message.ConnectionId}");
-                            RequestConnectionClose(message.ConnectionId, "peer closure");
+                            RequestConnectionClose(message.ConnectionId);
                             break;
                     }
 
                     writerTask = WriterTask();
                 }
 
-                WaitForCompletedConnections();
+                if (reaperClock.Elapsed >= ConnectionReapInterval)
+                {
+                    reaperClock.Restart();
+                    WaitForCompletedConnections();
+                }
             }
         }
     }
