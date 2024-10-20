@@ -191,12 +191,16 @@ namespace filestream_proxy
                     Size = (uint) buffer.Length
                 };
                 
+                var delay = false;
                 while (true)
                 {
                     if (cancel != null && cancel.Value.IsCancellationRequested)
                         throw new TaskCanceledException();
                     
-                    Thread.Sleep(checkInterval);
+                    if (delay)
+                        Thread.Sleep(checkInterval);
+                    delay = true;
+
                     var lockFile = LockFile.Acquire(config.LockPath);
                     if (lockFile == null) continue;
 
@@ -218,12 +222,16 @@ namespace filestream_proxy
             
             return Task.Run(() =>
             {
+                var delay = false;
                 while (true)
                 {
                     if (cancel != null && cancel.Value.IsCancellationRequested)
                         throw new TaskCanceledException();
                         
-                    Thread.Sleep(checkInterval);
+                    if (delay)
+                        Thread.Sleep(checkInterval);
+                    delay = true;
+
                     var lockFile = LockFile.Acquire(config.LockPath);
                     if (lockFile == null) continue;
 
@@ -464,7 +472,7 @@ namespace filestream_proxy
     /// Passes data between a socket and a read/write pipe file.
     sealed class ConnectionWorker
     {
-        private static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(10);
+        private static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
         
         private Socket _socket;
         private IConnectionMaster _master;
@@ -607,7 +615,7 @@ namespace filestream_proxy
     /// Base class for services that manage multiple connections.
     abstract class TunnelService
     {
-        protected static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(10);
+        protected static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
         private const int MaxConnections = byte.MaxValue;
         private const int ControlPageCount = 8;
         private const int ControlPageSize = ControlMessage.TotalSize;
