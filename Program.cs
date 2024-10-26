@@ -182,71 +182,65 @@ namespace filestream_proxy
         
         /// Finds a free page in the pipe and initializes it with the provided contents. If no
         /// page can be found immediately, it is retried after sleeping for each check interval. 
-        public static Task AllocateAndWriteAsync(PipeFileConfig config, ulong serial, ReadOnlyMemory<byte> buffer, TimeSpan checkInterval, CancellationToken? cancel)
+        public static async Task AllocateAndWriteAsync(PipeFileConfig config, ulong serial, ReadOnlyMemory<byte> buffer, TimeSpan checkInterval, CancellationToken? cancel)
         {
             if (buffer.Length > config.PageCapacity)
                 throw new ArgumentException($"Buffer capacity to large: {buffer.Length} > {config.PageCapacity}");
             
-            return Task.Run(() =>
+            var header = new PageHeader
             {
-                var header = new PageHeader
-                {
-                    Serial = serial,
-                    Size = (uint) buffer.Length
-                };
-                
-                var delay = false;
-                while (true)
-                {
-                    if (cancel != null && cancel.Value.IsCancellationRequested)
-                        throw new TaskCanceledException();
-                    
-                    if (delay)
-                        Thread.Sleep(checkInterval);
-                    delay = true;
+                Serial = serial,
+                Size = (uint) buffer.Length
+            };
+            
+            var delay = false;
+            while (true)
+            {
+                if (cancel != null && cancel.Value.IsCancellationRequested)
+                    throw new TaskCanceledException();
 
-                    var lockFile = LockFile.Acquire(config.LockPath);
-                    if (lockFile == null) continue;
+                if (delay)
+                    await Task.Delay(checkInterval);
+                delay = true;
 
-                    using var pipeFile = new PipeFile(lockFile, config);
-                    if (!pipeFile.AllocatePage(header)) continue;
-                    pipeFile.WritePage(serial, buffer.Span);
-                    break;
-                }
-            });
+                var lockFile = LockFile.Acquire(config.LockPath);
+                if (lockFile == null) continue;
+
+                using var pipeFile = new PipeFile(lockFile, config);
+                if (!pipeFile.AllocatePage(header)) continue;
+                pipeFile.WritePage(serial, buffer.Span);
+                break;
+            }
         }
         
         /// Finds the page in the pipe for the provided serial and reads it into the given buffer.
         /// If no page representing that serial is present, this sleeps for the check interval
         /// and retries until the page is found.  
-        public static Task<PageHeader> ReadAndReleaseAsync(PipeFileConfig config, ulong serial, Memory<byte> buffer, TimeSpan checkInterval, CancellationToken? cancel)
+        public static async Task<PageHeader> ReadAndReleaseAsync(PipeFileConfig config, ulong serial, Memory<byte> buffer, TimeSpan checkInterval, CancellationToken? cancel)
         {
             if (buffer.Length < config.PageCapacity)
                 throw new ArgumentException($"Buffer capacity to small: {buffer.Length} < {config.PageCapacity}");
             
-            return Task.Run(() =>
+            var delay = false;
+            while (true)
             {
-                var delay = false;
-                while (true)
-                {
-                    if (cancel != null && cancel.Value.IsCancellationRequested)
-                        throw new TaskCanceledException();
-                        
-                    if (delay)
-                        Thread.Sleep(checkInterval);
-                    delay = true;
+                if (cancel != null && cancel.Value.IsCancellationRequested)
+                    throw new TaskCanceledException();
 
-                    var lockFile = LockFile.Acquire(config.LockPath);
-                    if (lockFile == null) continue;
+                if (delay)
+                    await Task.Delay(checkInterval);
+                delay = true;
 
-                    using var pipeFile = new PipeFile(lockFile, config);
-                    if (!pipeFile.ReadPage(serial, buffer.Span, out var header))
-                        continue;
-                    
-                    pipeFile.ReleasePage(serial);
-                    return header;
-                }
-            });
+                var lockFile = LockFile.Acquire(config.LockPath);
+                if (lockFile == null) continue;
+
+                using var pipeFile = new PipeFile(lockFile, config);
+                if (!pipeFile.ReadPage(serial, buffer.Span, out var header))
+                    continue;
+                
+                pipeFile.ReleasePage(serial);
+                return header;
+            }
         }
 
         /// Opens a pipe file at the given path. An empty or corrupt file is initialized with a
