@@ -606,7 +606,7 @@ namespace filestream_proxy
         protected static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
         protected static readonly TimeSpan ConnectionReapInterval = TimeSpan.FromSeconds(1);
         private const int MaxConnections = byte.MaxValue;
-        private const int ControlPageCount = 8;
+        private const int ControlPageCount = MaxConnections;
         private const int ControlPageSize = ControlMessage.TotalSize;
         private const int WorkerPageCount = 64;
         private const int WorkerPageSize = 8192;
