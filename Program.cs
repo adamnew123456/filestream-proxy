@@ -498,12 +498,12 @@ namespace filestream_proxy
         }
 
         /// Passes data from the socket to the read pipe, and from the write pipe onto the socket. Stops when the cancellation trips or an exception occurs.
-        public void Run()
+        public async Task Run()
         {
             ulong readSerial = PageHeader.SerialUnused + 1;
             var readBuffer = new byte[_readPipe.PageCapacity];
             var readerTask = ReaderTask(readSerial, readBuffer);
-            
+
             ulong writeSerial = PageHeader.SerialUnused + 1;
             var writeBuffer = new byte[_readPipe.PageCapacity];
             var writerTask = WriterTask(writeSerial, writeBuffer);
@@ -513,13 +513,13 @@ namespace filestream_proxy
             {
                 try
                 {
-                    var action = Task.WaitAny(readerTask, writerTask);
-                    if (action == 0)
+                    var nextTask = await Task.WhenAny(readerTask, writerTask);
+                    if (ReferenceEquals(nextTask, readerTask))
                     {
                         readSerial = readerTask.Result;
                         readerTask = ReaderTask(readSerial, readBuffer);
                     }
-                    else if (action == 1)
+                    else
                     {
                         writeSerial = writerTask.Result;
                         writerTask = WriterTask(writeSerial, writeBuffer);
@@ -529,13 +529,11 @@ namespace filestream_proxy
                 {
                     if (err is AggregateException)
                         err = ((AggregateException)err).InnerExceptions[0];
-                    Console.WriteLine($"{connectionId} received error [{err.Message}], closing");
-                    _master.Cancel(true, "connection exception");
-                    break;
+                    _master.Cancel(true, $"connection exception ({err.Message})");
                 }
             }
-            
-            Console.WriteLine($"{connectionId} read={Interlocked.Read(ref _bytesRead)} wrote={Interlocked.Read(ref _bytesWritten)}");
+
+            // Console.WriteLine($"{connectionId} read={Interlocked.Read(ref _bytesRead)} wrote={Interlocked.Read(ref _bytesWritten)}");
             _socket.Close();
             _socket.Dispose();
         }
@@ -571,11 +569,11 @@ namespace filestream_proxy
     /// Tracks a connection worker along with its cancellation and status.
     sealed class ConnectionContext : IConnectionMaster, IDisposable
     {
-        private Thread _worker;
         private CancellationTokenSource _source;
         
         public byte Id { get; }
         public CancellationToken Token { get; }
+        public Task Worker { get; set; }
         
         /// Whether to notify the other end of the control pipe. Not required when the peer requested the close, but
         /// will be true if the socket closed on our end.
@@ -586,20 +584,6 @@ namespace filestream_proxy
             _source = new CancellationTokenSource();
             Id = id;
             Token = _source.Token;
-        }
-
-        /// Creates a new thread for the worker and starts it.
-        public void Start(ConnectionWorker worker)
-        {
-            _worker = new Thread(worker.Run);
-            _worker.Start();
-        }
-        
-        /// Waits for the worker thread to stop.
-        public void Join()
-        {
-            Console.WriteLine($"<cancel> waiting for {Id} thread to join");
-            _worker.Join();
         }
 
         /// Asks the worker to stop itself.
@@ -708,16 +692,14 @@ namespace filestream_proxy
             var dead = 0;
             for (byte i = 0; i < _connections.Length; i++)
             {
-                if (_connections[i] == null) continue;
-
                 var cnx = _connections[i];
-                if (cnx.Token.IsCancellationRequested)
+                if (cnx == null) continue;
+                if (cnx.Worker.IsCompleted)
                 {
                     if (cnx.NotifyPeer)
                         SendControlMessage(ControlCommand.Close, i);
                     
-                    cnx.Join();
-                    cnx.Dispose();
+                    _connections[i].Dispose();
                     _connections[i] = null;
                     dead++;
                 }
@@ -726,6 +708,14 @@ namespace filestream_proxy
             }
             if (live > 0 || dead > 0)
                 Console.WriteLine($"<tunnel> reaped collections live={live} dead={dead}");
+        }
+
+        /// Gets an enumerable containing tasks for all live connections.
+        protected IEnumerable<Task> ConnectionTasks()
+        {
+            return _connections
+                .Where(c => c != null)
+                .Select(c => c.Worker);
         }
 
         /// Creates a pipe for sending socket data.
@@ -772,64 +762,62 @@ namespace filestream_proxy
             _listenAddress = listenAddress;
         }
 
-        public void Run()
+        public async Task Run()
         {
+            const int LISTENER_TASK = 0;
+            const int WRITER_TASK = 1;
+            
             var listener = new TcpListener(_listenAddress);
             listener.Start();
-            var listenerTask = listener.AcceptSocketAsync();
+            var coreTasks = new Task[]
+            {
+                listener.AcceptSocketAsync(),
+                WriterTask()
+            };
             
-            var writerTask = WriterTask();
-
             while (true)
             {
-                var reaperClock = Stopwatch.StartNew();
-                var action = Task.WaitAny(listenerTask, writerTask, Task.Delay(ConnectionReapInterval));
-                switch (action)
+                var tasks = ConnectionTasks().Concat(coreTasks);
+                var nextTask = await Task.WhenAny(tasks);
+                if (ReferenceEquals(nextTask, coreTasks[LISTENER_TASK]))
                 {
-                    case 0:
+                    var client = (nextTask as Task<Socket>).Result;
+                    var newConnectionId = FindFreeConnection();
+                    if (newConnectionId == null)
                     {
-                        var client = listenerTask.Result;
-                        var newConnectionId = FindFreeConnection();
-                        if (newConnectionId == null)
-                        {
-                            Console.WriteLine($"<listener> discarding connection from {client.RemoteEndPoint}");
-                            client.Close();
-                        }
-                        else
-                        {
-                            SendControlMessage(ControlCommand.Connect, (byte)newConnectionId);
+                        //Console.WriteLine($"<listener> discarding connection from {client.RemoteEndPoint}");
+                        client.Close();
+                    }
+                    else
+                    {
+                        SendControlMessage(ControlCommand.Connect, (byte)newConnectionId);
 
-                            var workerReadPipe = NewWorkerReadPipe((byte)newConnectionId);
-                            var workerWritePipe = NewWorkerWritePipe((byte)newConnectionId);
-                            workerReadPipe.Clean();
-                            workerWritePipe.Clean();
-                            var context = new ConnectionContext((byte)newConnectionId);
-                            var worker = new ConnectionWorker(client, context, workerReadPipe, workerWritePipe);
-                            context.Start(worker);
-                            
-                            _connections[newConnectionId.Value] = context;
-                            Console.WriteLine($"<listener> accepted connection from {client.RemoteEndPoint}");
-                        }
+                        var workerReadPipe = NewWorkerReadPipe((byte)newConnectionId);
+                        var workerWritePipe = NewWorkerWritePipe((byte)newConnectionId);
+                        workerReadPipe.Clean();
+                        workerWritePipe.Clean();
+                        var context = new ConnectionContext((byte)newConnectionId);
+                        var worker = new ConnectionWorker(client, context, workerReadPipe, workerWritePipe);
+                        context.Worker = worker.Run();
                         
-                        listenerTask = listener.AcceptSocketAsync();
-                        break;
+                        _connections[newConnectionId.Value] = context;
+                        //Console.WriteLine($"<listener> accepted connection from {client.RemoteEndPoint}");
+                        Console.WriteLine($"<listener> accepted connection {newConnectionId}");
                     }
-                    case 1:
-                    {
-                        var message = writerTask.Result;
-                        if (message.Command == ControlCommand.Close)
-                        {
-                            Console.WriteLine($"<listener> peer closing {message.ConnectionId}");
-                            RequestConnectionClose(message.ConnectionId);
-                        }
-                        writerTask = WriterTask();
-                        break;
-                    }
+                    
+                    coreTasks[LISTENER_TASK] = listener.AcceptSocketAsync();
                 }
-
-                if (reaperClock.Elapsed >= ConnectionReapInterval)
+                else if (ReferenceEquals(nextTask, coreTasks[WRITER_TASK]))
                 {
-                    reaperClock.Restart();
+                    var message = (nextTask as Task<ControlMessage>).Result;
+                    if (message.Command == ControlCommand.Close)
+                    {
+                        RequestConnectionClose(message.ConnectionId);
+                    }
+                    coreTasks[WRITER_TASK] = WriterTask();
+                }
+                else
+                {
                     WaitForCompletedConnections();
                 }
             }
@@ -847,17 +835,16 @@ namespace filestream_proxy
             _remoteAddress = remoteAddress;
         }
 
-        public void Run()
+        public async Task Run()
         {
-            var writerTask = WriterTask();
-
+            var coreTasks = new Task[] { WriterTask() };
             while (true)
             {
-                var reaperClock = Stopwatch.StartNew();
-                var action = Task.WaitAny(writerTask, Task.Delay(ConnectionReapInterval));
-                if (action == 0)
+                var tasks = ConnectionTasks().Concat(coreTasks);
+                var nextTask = await Task.WhenAny(tasks);
+                if (ReferenceEquals(nextTask, coreTasks[0]))
                 {
-                    var message = writerTask.Result;
+                    var message = (nextTask as Task<ControlMessage>).Result;
                     switch (message.Command)
                     {
                         case ControlCommand.Connect:
@@ -870,10 +857,10 @@ namespace filestream_proxy
                             var workerWritePipe = NewWorkerWritePipe(message.ConnectionId);
                             var context = new ConnectionContext(message.ConnectionId);
                             var worker = new ConnectionWorker(client, context, workerWritePipe, workerReadPipe);
-                            context.Start(worker);
+                            context.Worker = worker.Run();
 
                             _connections[message.ConnectionId] = context;
-                            Console.WriteLine($"<remote> made connection to {_remoteAddress}");
+                            //Console.WriteLine($"<remote> made connection via {client.LocalEndPoint}");
                             break;
                         }
                         case ControlCommand.Close:
@@ -882,12 +869,10 @@ namespace filestream_proxy
                             break;
                     }
 
-                    writerTask = WriterTask();
+                    coreTasks[0] = WriterTask();
                 }
-
-                if (reaperClock.Elapsed >= ConnectionReapInterval)
+                else
                 {
-                    reaperClock.Restart();
                     WaitForCompletedConnections();
                 }
             }
@@ -903,7 +888,7 @@ namespace filestream_proxy
             Environment.Exit(1);
         }
         
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
             if (args.Length == 0)
                 Usage("'listen', 'forward', or 'clean' is required");
@@ -916,7 +901,7 @@ namespace filestream_proxy
                         args[1],
                         TunnelService.NewControlReadPipe(args[1]),
                         TunnelService.NewControlWritePipe(args[1]));
-                    service.Run();
+                    await service.Run();
                     break;
                 }
                 case "forward":
@@ -925,7 +910,7 @@ namespace filestream_proxy
                         args[1],
                         TunnelService.NewControlWritePipe(args[1]),
                         TunnelService.NewControlReadPipe(args[1]));
-                    service.Run();
+                    await service.Run();
                     break;
                 }
                 case "clean":
