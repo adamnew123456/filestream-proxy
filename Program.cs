@@ -142,8 +142,10 @@ namespace filestream_proxy
 
             var readPipe = NewWorkerReadPipe(connectionId);
             var writePipe = NewWorkerWritePipe(connectionId);
-            _connections[connectionId] = ReadWriteConnection.Create(connectionId, socket, readPipe, writePipe, _controlPipe);
-            _connections[connectionId].AddTasks(_connectionTasks, _connectionKeys);
+
+            var cnx = ReadWriteConnection.Create(connectionId, socket, readPipe, writePipe, _controlPipe);
+            _connections[connectionId] = cnx;
+            cnx.AddTasks(_connectionTasks, _connectionKeys);
 
             await _controlPipe.Send(ControlCommand.Connect, connectionId);
             return true;
@@ -155,15 +157,15 @@ namespace filestream_proxy
             Debug.Assert(_connections[connectionId] == null, "Connection from server conflicts with local connection");
             var readPipe = NewWorkerReadPipe(connectionId);
             var writePipe = NewWorkerWritePipe(connectionId);
-            _connections[connectionId] = ReadWriteConnection.Create(connectionId, socket, writePipe, readPipe, _controlPipe);
-            _connections[connectionId].AddTasks(_connectionTasks, _connectionKeys);
+            var cnx = ReadWriteConnection.Create(connectionId, socket, writePipe, readPipe, _controlPipe);
+            cnx.AddTasks(_connectionTasks, _connectionKeys);
         }
 
         /// Processes a close message for the given connection.
         protected void ProcessCancel(byte connectionId, ConnectionDirection direction)
         {
-            Debug.Assert(_connections[connectionId] == null, "Unable to process close on null connection");
             var cnx = _connections[connectionId];
+            Debug.Assert(cnx != null, "Unable to process close on null connection");
             cnx.ProcessCancel(direction);
             if (cnx.ReadyToClose)
                 RemoveConnection(connectionId);
@@ -172,8 +174,9 @@ namespace filestream_proxy
         /// Removes a dead connection from the connection table.
         private void RemoveConnection(byte connectionId)
         {
-            Debug.Assert(_connections[connectionId] != null, "Cannot remove connection that is already dead");
-            _connections[connectionId].RemoveTasks(_connectionTasks, _connectionKeys);
+            var cnx = _connections[connectionId];
+            Debug.Assert(cnx != null, "Cannot remove connection that is already dead");
+            cnx.RemoveTasks(_connectionTasks, _connectionKeys);
             _connections[connectionId] = null;
         }
     }
