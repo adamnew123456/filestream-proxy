@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections;
 using System.Text;
+using Microsoft.Extensions.Logging;
 
 namespace filestream_proxy;
 
@@ -98,6 +99,9 @@ sealed class PipeFileConfig
 {
     /// The bytes at the start that identify a pipe file.
     public static readonly byte[] FileMagic = Encoding.ASCII.GetBytes("Pipe");
+    
+    /// The logger to write messages about this pipe to.
+    private ILogger? Logger;
         
     /// The path of the lock file that governs access to the pipe.
     public string LockPath { get; init; }
@@ -119,6 +123,13 @@ sealed class PipeFileConfig
         
     /// Compute the offset to a specific data block within the file.
     public int DataOffset(int page) => FileMagic.Length + (PageHeader.TotalSize * PageCount) + (PageCapacity * page);
+
+    public ILogger GetLogger()
+    {
+        if (Logger == null)
+            Logger = Program.LogFactory.CreateLogger($"PipeFile.{PipePath}");
+        return Logger;
+    }
 
     /// Removes a stale lock.
     public void Clean()
@@ -147,14 +158,16 @@ sealed class PipeFile : IDisposable
     public static async Task AllocateAndWriteAsync(PipeFileConfig config, ulong serial, ReadOnlyMemory<byte> buffer, TimeSpan checkInterval, CancellationToken? cancel)
     {
         if (buffer.Length > config.PageCapacity)
-            throw new ArgumentException($"Buffer capacity to large: {buffer.Length} > {config.PageCapacity}");
+            throw new ArgumentException($"Buffer capacity too large: {buffer.Length} > {config.PageCapacity}");
             
         var header = new PageHeader
         {
             Serial = serial,
             Size = (uint) buffer.Length
         };
-            
+
+        var failedLocks = 0;
+        var failedPages = 0;
         var delay = false;
         while (true)
         {
@@ -166,12 +179,21 @@ sealed class PipeFile : IDisposable
             delay = true;
 
             var lockFile = LockFile.Acquire(config.LockPath);
-            if (lockFile == null) continue;
+            if (lockFile == null)
+            {
+                failedLocks++;
+                continue;
+            }
 
             using var pipeFile = new PipeFile(lockFile, config);
-            if (!pipeFile.AllocatePage(header)) continue;
+            if (!pipeFile.AllocatePage(header))
+            {
+                failedPages++;
+                continue;
+            }
             pipeFile.WritePage(serial, buffer.Span);
-            break;
+            config.GetLogger().LogTrace("Write completed {0}, locks:{1}, pages:{2}", serial, failedLocks, failedPages);
+            return;
         }
     }
         
@@ -183,6 +205,8 @@ sealed class PipeFile : IDisposable
         if (buffer.Length < config.PageCapacity)
             throw new ArgumentException($"Buffer capacity to small: {buffer.Length} < {config.PageCapacity}");
             
+        var failedLocks = 0;
+        var failedPages = 0;
         var delay = false;
         while (true)
         {
@@ -194,13 +218,21 @@ sealed class PipeFile : IDisposable
             delay = true;
 
             var lockFile = LockFile.Acquire(config.LockPath);
-            if (lockFile == null) continue;
+            if (lockFile == null)
+            {
+                failedLocks++;
+                continue;
+            }
 
             using var pipeFile = new PipeFile(lockFile, config);
             if (!pipeFile.ReadPage(serial, buffer.Span, out var header))
+            {
+                failedPages++;
                 continue;
-                
+            }
+
             pipeFile.ReleasePage(serial);
+            config.GetLogger().LogTrace("Read completed {0}, locks:{1}, pages:{2}", serial, failedLocks, failedPages);
             return header;
         }
     }

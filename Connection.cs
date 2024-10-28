@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
 
 namespace filestream_proxy;
 
@@ -36,7 +37,7 @@ enum ConnectionState
 }
 
 /// A connection worker manages the direction-independent parts of a connection.
-abstract class BaseConnectionWorker
+abstract class ConnectionWorker
 {
     protected readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
     protected readonly TimeSpan SocketTimeout = TimeSpan.FromMinutes(1);
@@ -45,28 +46,46 @@ abstract class BaseConnectionWorker
     protected PipeFileConfig DataPipe;
     protected byte[] Buffer;
     protected CancellationToken Cancel;
+    protected ILogger Logger;
+    protected long Bytes;
     protected abstract ConnectionDirection Direction { get; }
-    
+
     private byte _connectionId;
     private Task? _task;
     private CancellationTokenSource _cancelSource;
-    private ControlPipe _controlPipe;
     
+    public ReadWriteConnection Owner { get; set; }
     /// What the connection is currently doing. See the documentation for the ConnectionState members for more information.
     public ConnectionState State { get; private set; }
 
-    protected BaseConnectionWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe, ControlPipe controlPipe)
+    protected ConnectionWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe)
     {
         _cancelSource = new CancellationTokenSource();
         _connectionId = connectionId;
-        _controlPipe = controlPipe;
+        Logger = Program.LogFactory.CreateLogger($"{GetType()}.{_connectionId}");
         Socket = socket;
         DataPipe = dataPipe;
         Cancel = _cancelSource.Token;
         State = ConnectionState.Unstarted;
         Buffer = new byte[dataPipe.PageCapacity];
     }
-
+    
+    /// Notifies the peer that this half of the connection has closed.
+    public Task SendCloseNotification(ControlPipe pipe)
+    {
+        Logger.LogDebug("Notify close");
+        var peerDirection = Direction == ConnectionDirection.Reader ? ControlCommand.CloseWrite : ControlCommand.CloseRead;
+        return pipe.Send(peerDirection, _connectionId);
+    }
+    
+    /// Updates the task list and associated data mapping to include this connection.
+    public void RemoveTask(IList<Task> tasks)
+    {
+        var idx = _connectionId * 2;
+        if (Direction == ConnectionDirection.Writer) idx++;
+        tasks[idx] = Task.Delay(-1);
+    }
+    
     /// Waits for the connection to finish processing data. Once this task returns, the connection is in one
     /// of the non-running states. If the connection is already in a non-running state, this returns a task
     /// that blocks forever.
@@ -75,6 +94,8 @@ abstract class BaseConnectionWorker
         switch (State)
         {
             case ConnectionState.Unstarted:
+                Logger.LogDebug("Starting IO task");
+                State = ConnectionState.Running;
                 _task = Worker();
                 return _task;
             case ConnectionState.Running:
@@ -91,23 +112,31 @@ abstract class BaseConnectionWorker
     {
         if (State == ConnectionState.Running)
         {
+            Logger.LogDebug("Processing cancel on live connection");
             State = ConnectionState.Cancelling;
             _cancelSource.Cancel();
         }
         else if (State == ConnectionState.PendingCloseConfirm)
+        {
+            Logger.LogDebug("Processing cancel on zombie connection");
             State = ConnectionState.Closed;
+        }
     }
 
     /// Wraps the read-specific/write-specific task which updates the connection state and cleans up resources.
-    private async Task Worker()
+    private async Task<ConnectionWorker> Worker()
     {
+        Logger.LogDebug("Beginning IO loop");
         try
         {
             await InnerWorker();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Just close the connection in response to an IO error or cancellation, the error is unimportant
+            if (ex is AggregateException)
+                ex = ((AggregateException)ex).InnerExceptions[0];
+            
+            Logger.LogDebug("IO exception: {0}", ex.Message);
         }
         finally
         {
@@ -115,18 +144,20 @@ abstract class BaseConnectionWorker
             // wait for a confirmation
             if (State == ConnectionState.Running)
             {
+                Logger.LogInformation("Stopped by IO after {0} bytes, waiting for cancel", Bytes);
                 State = ConnectionState.PendingCloseConfirm;
-                // Must be reversed since our writer corresponds to the peer's reader, and vice versa
-                var command = Direction == ConnectionDirection.Reader ? ControlCommand.CloseWrite : ControlCommand.CloseRead;
-                await _controlPipe.Send(command, _connectionId);
             }
             else
+            {
+                Logger.LogInformation("Stopped by cancel after {0} bytes, closing", Bytes);
                 State = ConnectionState.Closed;
-            
+            }
+
             Socket.Shutdown(Direction == ConnectionDirection.Reader ? SocketShutdown.Receive : SocketShutdown.Send);
             _cancelSource.Dispose();
             _task = null;
         }
+        return this;
     }
     
     /// Transfers data from the socket to the pipe file, or vice versa.
@@ -134,23 +165,27 @@ abstract class BaseConnectionWorker
 }
 
 /// Connection worker that moves data from the socket to the pipe file.
-class ReadWorker : BaseConnectionWorker
+class ReadWorker : ConnectionWorker
 {
     protected override ConnectionDirection Direction => ConnectionDirection.Reader;
 
-    public ReadWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe, ControlPipe controlPipe) : base(connectionId, socket, dataPipe, controlPipe)
+    public ReadWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe) : base(connectionId, socket, dataPipe)
     {
         socket.ReceiveTimeout = (int)SocketTimeout.TotalMilliseconds;
     }
 
     protected override async Task InnerWorker()
     {
+        Logger.LogDebug("Transfer socket -> {0}", DataPipe.PipePath);
         var serial = PageHeader.SerialUnused + 1;
         while (true)
         {
+            Logger.LogTrace("Wait for recv");
             var read = await Socket.ReceiveAsync(Buffer, SocketFlags.None, Cancel);
             if (read == 0) return;
 
+            Logger.LogTrace("Wait for page {0}", read);
+            Bytes += read;
             await PipeFile.AllocateAndWriteAsync(DataPipe, serial, Buffer.AsMemory(0, read), CheckInterval, Cancel);
             serial++;
         }
@@ -158,32 +193,29 @@ class ReadWorker : BaseConnectionWorker
 }
 
 /// Connection worker that moves data from the pipe file to the socket.
-class WriteWorker : BaseConnectionWorker
+class WriteWorker : ConnectionWorker
 {
     protected override ConnectionDirection Direction => ConnectionDirection.Writer;
 
-    public WriteWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe, ControlPipe controlPipe) : base(connectionId, socket, dataPipe, controlPipe)
+    public WriteWorker(byte connectionId, Socket socket, PipeFileConfig dataPipe) : base(connectionId, socket, dataPipe)
     {
         socket.SendTimeout = (int)SocketTimeout.TotalMilliseconds;
     }
 
     protected override async Task InnerWorker()
     {
+        Logger.LogDebug("Transfer socket <- {0}", DataPipe.PipePath);
         var serial = PageHeader.SerialUnused + 1;
         while (true)
         {
+            Logger.LogTrace("Wait for page");
             var page = await PipeFile.ReadAndReleaseAsync(DataPipe, serial, Buffer, CheckInterval, Cancel);
+            Logger.LogTrace("Wait for send {0}", page.Size);
             await Socket.SendAll(Buffer.AsMemory(0, (int)page.Size), Cancel);
+            Bytes += page.Size;
             serial++;
         }
     }
-}
-
-/// Holds data associated with a reader or writer task.
-struct ConnectionKey
-{
-    public ReadWriteConnection Connection { get; init; }
-    public ConnectionDirection Direction { get; init; }
 }
 
 /// Wrapper around a reader/writer pair which manages pending task list.
@@ -194,6 +226,8 @@ sealed class ReadWriteConnection
     private ReadWorker _reader;
     private WriteWorker _writer;
     
+    public byte Id { get; }
+    
     /// Whether both ends of the connections have closed and received confirmation from the peer.
     public bool ReadyToClose => _reader.State == ConnectionState.Closed && _writer.State == ConnectionState.Closed;
 
@@ -203,6 +237,9 @@ sealed class ReadWriteConnection
         _socket = socket;
         _reader = reader;
         _writer = writer;
+        _reader.Owner = this;
+        _writer.Owner = this;
+        Id = connectionId;
     }
 
     /// Processes a cancel message for one direction of the connection.
@@ -213,37 +250,26 @@ sealed class ReadWriteConnection
         else
             _writer.ProcessCancel();
     }
+    
 
     /// Updates the task list and associated data mapping to include this connection.
-    public void AddTasks(IList<Task> tasks, IDictionary<Task, ConnectionKey> owners)
+    public void AddTasks(IList<Task> tasks)
     {
-        var readerTask = _reader.WaitForClose();
-        tasks[_connectionId * 2] = readerTask;
-        owners[readerTask] = new ConnectionKey { Connection = this, Direction = ConnectionDirection.Reader };
-        
-        var writerTask = _writer.WaitForClose();
-        tasks[(_connectionId * 2) + 1] = writerTask;
-        owners[writerTask] = new ConnectionKey { Connection = this, Direction = ConnectionDirection.Writer };
+        var idx = _connectionId * 2;
+        tasks[idx] = _reader.WaitForClose();
+        tasks[idx + 1] = _writer.WaitForClose();
     }
     
-    /// Updates the task list and associated data mapping to exclude this connection.
-    public void RemoveTasks(IList<Task> tasks, IDictionary<Task, ConnectionKey> owners)
+    /// Closes the socket associated with this connection.
+    public void Close()
     {
-        var readerTask = tasks[_connectionId * 2];
-        tasks[_connectionId * 2] = Task.Delay(Timeout.Infinite);
-        owners.Remove(readerTask);
-        
-        var writerTask = tasks[(_connectionId * 2) + 1];
-        tasks[(_connectionId * 2) + 1] = Task.Delay(Timeout.Infinite);
-        owners.Remove(writerTask);
-
         _socket.Close();
     }
 
-    public static ReadWriteConnection Create(byte connectionId, Socket socket, PipeFileConfig readPipe, PipeFileConfig writePipe, ControlPipe controlPipe)
+    public static ReadWriteConnection Create(byte connectionId, Socket socket, PipeFileConfig readPipe, PipeFileConfig writePipe)
     {
-        var reader = new ReadWorker(connectionId, socket, readPipe, controlPipe);
-        var writer = new WriteWorker(connectionId, socket, writePipe, controlPipe);
+        var reader = new ReadWorker(connectionId, socket, readPipe);
+        var writer = new WriteWorker(connectionId, socket, writePipe);
         return new ReadWriteConnection(connectionId, socket, reader, writer);
     }
 

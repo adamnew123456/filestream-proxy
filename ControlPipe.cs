@@ -58,8 +58,6 @@ sealed class ControlPipe
     
     private ulong _readSerial;
     private ulong _writeSerial;
-    private byte[] _readBuffer;
-    private byte[] _writeBuffer;
     private PipeFileConfig _readPipe;
     private PipeFileConfig _writePipe;
 
@@ -69,29 +67,29 @@ sealed class ControlPipe
         _writePipe = writePipe;
         _readSerial = PageHeader.SerialUnused + 1;
         _writeSerial = PageHeader.SerialUnused + 1;
-        _readBuffer = new byte[_readPipe.PageCapacity];
-        _writeBuffer = new byte[_readPipe.PageCapacity];
     }
     
     /// Send a control message over the tunnel's control pipe.
     public async Task Send(ControlCommand command, byte connectionId)
     {
+        var readBuffer = new byte[_readPipe.PageCapacity];
         var message = new ControlMessage
         {
             Command = command,
             ConnectionId = connectionId
         };
 
-        message.Write(_writeBuffer);
-        await PipeFile.AllocateAndWriteAsync(_writePipe, _writeSerial, _writeBuffer, CheckInterval, null); 
-        _writeSerial++;
+        message.Write(readBuffer);
+        await PipeFile.AllocateAndWriteAsync(_readPipe, _readSerial, readBuffer, CheckInterval, null); 
+        _readSerial++;
     }
     
     /// Reads a control message from the control pipe.
     public async Task<ControlMessage> Receive()
     {
-        var page = await PipeFile.ReadAndReleaseAsync(_readPipe, _readSerial, _readBuffer, CheckInterval, null);
-        _readSerial++;
-        return ControlMessage.Read(_readBuffer.AsSpan()[..(int)page.Size]);
+        var writeBuffer = new byte[_writePipe.PageCapacity];
+        var page = await PipeFile.ReadAndReleaseAsync(_writePipe, _writeSerial, writeBuffer, CheckInterval, null);
+        _writeSerial++;
+        return ControlMessage.Read(writeBuffer.AsSpan()[..(int)page.Size]);
     }
 }

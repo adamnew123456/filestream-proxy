@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
 
 namespace filestream_proxy
 {
@@ -45,8 +46,6 @@ namespace filestream_proxy
     /// Base class for services that manage multiple connections.
     abstract class TunnelService
     {
-        protected static readonly TimeSpan CheckInterval = TimeSpan.FromMilliseconds(50);
-        protected static readonly TimeSpan ConnectionReapInterval = TimeSpan.FromSeconds(1);
         private const int MaxConnections = byte.MaxValue;
         private const int ControlPageCount = MaxConnections;
         private const int ControlPageSize = ControlMessage.TotalSize;
@@ -58,13 +57,16 @@ namespace filestream_proxy
         
         private readonly ReadWriteConnection?[] _connections = new ReadWriteConnection?[MaxConnections];
         private IList<Task> _connectionTasks;
-        private IDictionary<Task, ConnectionKey> _connectionKeys = new Dictionary<Task, ConnectionKey>();
+
+        protected ILogger Logger;
         
         protected TunnelService(string pipeDirectory, PipeFileConfig controlReadPipe, PipeFileConfig controlWritePipe)
         {
             _pipeDirectory = pipeDirectory;
             _controlPipe = new ControlPipe(controlReadPipe, controlWritePipe);
             _connectionTasks = ReadWriteConnection.InitTasks(MaxConnections);
+            
+            Logger = Program.LogFactory.CreateLogger(GetType());
         }
 
         /// Reads a control message from the pipe.
@@ -137,17 +139,24 @@ namespace filestream_proxy
         protected async Task<bool> AddServerConnection(Socket socket)
         {
             var cid = FindFreeConnection();
-            if (cid == null) return false;
+            if (cid == null)
+            {
+                Logger.LogDebug("No room for new connection");
+                return false;
+            }
             var connectionId = cid.Value;
 
             var readPipe = NewWorkerReadPipe(connectionId);
+            readPipe.Clean();
             var writePipe = NewWorkerWritePipe(connectionId);
+            writePipe.Clean();
 
-            var cnx = ReadWriteConnection.Create(connectionId, socket, readPipe, writePipe, _controlPipe);
+            var cnx = ReadWriteConnection.Create(connectionId, socket, readPipe, writePipe);
             _connections[connectionId] = cnx;
-            cnx.AddTasks(_connectionTasks, _connectionKeys);
+            cnx.AddTasks(_connectionTasks);
 
             await _controlPipe.Send(ControlCommand.Connect, connectionId);
+            Logger.LogDebug("Allocated new connection {0}", connectionId);
             return true;
         }
         
@@ -157,8 +166,10 @@ namespace filestream_proxy
             Debug.Assert(_connections[connectionId] == null, "Connection from server conflicts with local connection");
             var readPipe = NewWorkerReadPipe(connectionId);
             var writePipe = NewWorkerWritePipe(connectionId);
-            var cnx = ReadWriteConnection.Create(connectionId, socket, writePipe, readPipe, _controlPipe);
-            cnx.AddTasks(_connectionTasks, _connectionKeys);
+            var cnx = ReadWriteConnection.Create(connectionId, socket, writePipe, readPipe);
+            _connections[connectionId] = cnx;
+            cnx.AddTasks(_connectionTasks);
+            Logger.LogDebug("Linked new connection {0}", connectionId);
         }
 
         /// Processes a close message for the given connection.
@@ -168,16 +179,27 @@ namespace filestream_proxy
             Debug.Assert(cnx != null, "Unable to process close on null connection");
             cnx.ProcessCancel(direction);
             if (cnx.ReadyToClose)
-                RemoveConnection(connectionId);
+                RemoveConnection(cnx);
+            else
+                Logger.LogDebug("{0} {1} zombie", connectionId, direction);
+        }
+        
+        /// Processes a close message for the given connection.
+        protected Task ConnectionDone(Task task)
+        {
+            var worker = (task as Task<ConnectionWorker>).Result;
+            worker.RemoveTask(_connectionTasks);
+            if (worker.Owner.ReadyToClose)
+                RemoveConnection(worker.Owner);
+            return worker.SendCloseNotification(_controlPipe);
         }
 
         /// Removes a dead connection from the connection table.
-        private void RemoveConnection(byte connectionId)
+        private void RemoveConnection(ReadWriteConnection connection)
         {
-            var cnx = _connections[connectionId];
-            Debug.Assert(cnx != null, "Cannot remove connection that is already dead");
-            cnx.RemoveTasks(_connectionTasks, _connectionKeys);
-            _connections[connectionId] = null;
+            Logger.LogInformation("{0} finished", connection.Id);
+            connection.Close();
+            _connections[connection.Id] = null;
         }
     }
 
@@ -223,8 +245,11 @@ namespace filestream_proxy
                         ProcessCancel(message.ConnectionId, ConnectionDirection.Reader);
                     else if (message.Command == ControlCommand.CloseWrite)
                         ProcessCancel(message.ConnectionId, ConnectionDirection.Writer);
+                    
                     coreTasks[WRITER_TASK] = ReadCommand();
                 }
+                else
+                    await ConnectionDone(nextTask);
             }
         }
     }
@@ -267,12 +292,20 @@ namespace filestream_proxy
                     }
                     coreTasks[0] = ReadCommand();
                 }
+                else
+                    await ConnectionDone(nextTask);
             }
         }
     }
 
     internal class Program
     {
+        public static readonly ILoggerFactory LogFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddSimpleConsole();
+            builder.SetMinimumLevel(LogLevel.Information);
+        });
+        
         private static void Usage(string context)
         {
             Console.WriteLine("Usage: filestream-proxy (listen DIRECTORY IP:PORT | forward DIRECTORY IP:PORT | clean DIRECTORY)");
